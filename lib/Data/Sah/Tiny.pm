@@ -15,8 +15,8 @@ use Data::Sah::Normalize qw(normalize_schema);
 use Exporter qw(import);
 our @EXPORT_OK = qw(gen_validator normalize_schema);
 
-# data_term, return_type must already be set
-sub _gen_src_code {
+# data_term must already be set
+sub _gen_expr {
     my ($schema0, $opts) = @_;
 
     my $nschema = $opts->{schema_is_normalized} ?
@@ -26,51 +26,43 @@ sub _gen_src_code {
     my $clset = { %{$nschema->[1]} };
     my $dt = $opts->{data_term};
 
-    my $src = '';
-
-    my $code_fail_unless = sub { my $cond = shift; $src .= ($opts->{_fail_stmt}    // " return " . ($opts->{return_type} eq 'bool_valid+val' ? "[0,$dt]" : "0"))." unless $cond;" };
-    my $code_success_if  = sub { my $cond = shift; $src .= ($opts->{_success_stmt} // " return " . ($opts->{return_type} eq 'bool_valid+val' ? "[1,$dt]" : "1"))." if $cond;"     };
+    my ($default_expr, $success_if_undef_expr, @check_exprs);
 
     require Data::Dmp;
 
     # first, handle 'default'
     if (exists $clset->{default}) {
-        if ($dt =~ /\A\$_\[\d+\]\z/) {
-            $src .= "my \$_dst_tmp = $dt; ";
-            $dt = "\$_dst_tmp";
-        }
-        $src .= "$dt = ".Data::Dmp::dmp($clset->{default}).
-            " unless defined $dt;";
+        $default_expr = "$dt = defined($dt) ? $dt : ".
+            Data::Dmp::dmp($clset->{default});
+        delete $clset->{default};
     }
-    delete $clset->{default};
 
-    # then handle 'req'
+    # then handle 'req' & 'forbidden'
     if (delete $clset->{req}) {
-        $code_fail_unless->("defined($dt)");
+        push @check_exprs, "defined($dt)";
+    } elsif (delete $clset->{forbidden}) {
+        $success_if_undef_expr = "!defined($dt)";
+        push @check_exprs, "!defined($dt)";
     } else {
-        $code_success_if->("!defined($dt)");
+        $success_if_undef_expr = "!defined($dt)";
     }
 
   PROCESS_BUILTIN_TYPES: {
         if ($type eq 'int') {
-            $code_fail_unless->("!ref($dt) && $dt =~ /\\A-?[0-9]+\\z/");
-            if (defined(my $val = delete $clset->{min})) { $code_fail_unless->("$dt >= $val") }
-            if (defined(my $val = delete $clset->{max})) { $code_fail_unless->("$dt <= $val") }
+            push @check_exprs, "!ref($dt) && $dt =~ /\\A-?[0-9]+\\z/";
+            if (defined(my $val = delete $clset->{min})) { push @check_exprs, "$dt >= $val" }
+            if (defined(my $val = delete $clset->{max})) { push @check_exprs, "$dt <= $val" }
+        } elsif ($type eq 'str') {
+            push @check_exprs, "!ref($dt)";
+            if (defined(my $val = delete $clset->{min_len})) { push @check_exprs, "length $dt >= $val" }
+            if (defined(my $val = delete $clset->{max_len})) { push @check_exprs, "length $dt <= $val" }
         } elsif ($type eq 'array') {
-            $code_fail_unless->("ref($dt) eq 'ARRAY'");
-            if (defined(my $val = delete $clset->{min_len})) { $code_fail_unless->("\@{$dt} >= $val") }
-            if (defined(my $val = delete $clset->{max_len})) { $code_fail_unless->("\@{$dt} <= $val") }
+            push @check_exprs, "ref($dt) eq 'ARRAY'";
+            if (defined(my $val = delete $clset->{min_len})) { push @check_exprs, "\@{$dt} >= $val" }
+            if (defined(my $val = delete $clset->{max_len})) { push @check_exprs, "\@{$dt} <= $val" }
             if (defined(my $val = delete $clset->{of})) {
-                my $src_sub = _gen_src_code(
-                    $val,
-                    {
-                        data_term => "\$_dst_elem",
-                        return_type=>'bool_valid',
-                        _fail_stmt    => '($ok=0, last)',
-                        _success_stmt => '($ok=0, last)',
-                    },
-                );
-                $code_fail_unless->("do { my \$ok=1; for my \$_dst_elem (\@{$dt}) { $src_sub } \$ok }");
+                my $expr = _gen_expr($val, {data_term => "\$_dst_elem"});
+                push @check_exprs, "do { my \$ok=1; for my \$_dst_elem (\@{$dt}) { (\$ok=0, last) unless $expr } \$ok }";
             }
         } else {
             die "Unknown type '$type'";
@@ -82,10 +74,25 @@ sub _gen_src_code {
         }
     }
 
-    $src .= $opts->{return_type} eq 'bool_valid+val' ?
-        " [1, $dt]" : " 1";
+    my $expr = join(
+        "",
+        ($default_expr ? "( (($default_expr), 1), " : ""),
+        ($success_if_undef_expr ? "$success_if_undef_expr || (" : ""),
+        join(" && ", map { "($_)" } @check_exprs),
+        ($success_if_undef_expr ? ")" : ""),
+        ($default_expr ? ")" : ""),
+    );
 
-    $src;
+    if ($opts->{hash}) {
+        return {
+            v => 2,
+            result => $expr,
+            modules => [],
+            vars => {},
+        };
+    } else {
+        return $expr;
+    }
 }
 
 sub gen_validator {
@@ -93,22 +100,24 @@ sub gen_validator {
     $opts0 //= {};
 
     my $opts = {};
-    $opts->{_level} = 1;
     $opts->{schema_is_normalized} = delete $opts0->{schema_is_normalized};
     $opts->{source} = delete $opts0->{source};
+    $opts->{hash} = delete $opts0->{hash};
     $opts->{return_type} = delete $opts0->{return_type} // "bool_valid";
     $opts->{return_type} =~ /\A(bool_valid\+val|bool_valid)\z/
         or die "return_type must be bool_valid or bool_valid+val";
-    $opts->{data_term} = $opts0->{data_term} // '$_[0]';
+    $opts->{data_term} = delete $opts0->{data_term} // '$tmp';
     keys %$opts0 and die "Unknown option(s): ".join(", ", sort keys %$opts0);
 
-    my $dt0 = $opts->{data_term};
-    my $src0 = _gen_src_code($schema, $opts);
+    my $dt = $opts->{data_term};
+
+    my $expr = _gen_expr($schema, $opts);
+    return $expr if $opts->{hash};
     my $src = join(
         "",
-        "sub {",
-        ($dt0 eq '$_[0]' ? '' : " my $dt0;"),
-        $src0,
+        "sub { ",
+        "my $dt = shift; ",
+        ($opts->{return_type} eq 'bool_valid+val' ? "my \$_dst_res = $expr; [\$_dst_res, $dt]" : $expr),
         " }",
     );
     return $src if $opts->{source};
@@ -119,43 +128,70 @@ sub gen_validator {
 }
 
 1;
-# ABSTRACT: Make human-readable terse representation of Sah schema
+# ABSTRACT: Validate Sah schemas with as little code as possible
 
 =head1 SYNOPSIS
 
- use Data::Sah::Terse qw(terse_schema);
+ use Data::Sah::Tiny qw(normalize_schema gen_validator);
 
- say terse_schema("int");                                      # int
- say terse_schema(["int*", min=>0, max=>10]);                  # int
- say terse_schema(["array", {of=>"int"}]);                     # array[int]
- say terse_schema(["any*", of=>['int',['array'=>of=>"int"]]]); # int|array[int]
+ my $v = gen_validator([int => min=>1]);
+ say $v->(0); # false
+ say $v->(2); # true
 
 
 =head1 DESCRIPTION
 
+B<Early release. Not all types and clauses are supported.>
+
+This is a tiny alternative to L<Data::Sah>, with fewer dependencies and much
+faster compilation speed. But it supports only a subset of Data::Sah's features.
+
 
 =head1 FUNCTIONS
 
-None exported by default, but they are exportable.
+=head2 gen_validator($sch[, \%opts ]) => code|str
 
-=head2 terse_schema($sch[, \%opts]) => str
-
-Make a human-readable terse representation of Sah schema. Currently only schema
-type is shown, all clauses are ignored. Special handling for types C<array>,
-C<any> and C<all>. This routine is suitable for showing type in a function or
-CLI help message.
-
-Options:
+See L<Data::Sah>'s documentation. Supported options:
 
 =over
 
-=item * schema_is_normalized => bool
+=item * schema_is_normalized
+
+Bool.
+
+=item * return_type
+
+Str. Only "bool_valid" and "bool_valid+val" are supported.
+
+=item * data_term
+
+Str. Defaults to C<$_[0]>.
+
+=item * source
+
+Bool. Set to 1 to return source code instead of compiled coderef.
+
+=item * hash*
+
+Bool. If set to 1 will return compilation result details.
 
 =back
+
+=head2 normalize_schema
+
+See L<Data::Sah::Normalize>'s documentation.
+
+
+=hea1 PERFORMANCE NOTES
+
+Validator generation is several times faster than Data::Sah, so L<Params::Sah>
+with L<Data::Sah::Tiny> backend is in the same order of magnitude with other
+validator generators like L<Type::Params> and L<Params::ValidationCompiler>.
+See L<Bencher::Scenarios::ParamsSah>.
 
 
 =head1 SEE ALSO
 
-L<Data::Sah::Compiler::human>
+L<Data::Sah>
 
 =cut
