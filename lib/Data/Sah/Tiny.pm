@@ -182,7 +182,7 @@ Bool. If set to 1 will return compilation result details.
 See L<Data::Sah::Normalize>'s documentation.
 
 
-=hea1 PERFORMANCE NOTES
+=head1 PERFORMANCE NOTES
 
 Validator generation is several times faster than Data::Sah, so L<Params::Sah>
 with L<Data::Sah::Tiny> backend is in the same order of magnitude with other
